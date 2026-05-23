@@ -1,0 +1,3 @@
+- [ ] Shift the symbols in order according the assci order until the * - or + are in the middle and check what are the mappings
+- [ ] Check if I can reduce the and correct those case. It looks like almost always * should be a kind of multiplication, + a concatatenation or sum and - a way of difference.
+    - Use the same solver only why these examples and removing some operations that consider it shouldn't search on.
