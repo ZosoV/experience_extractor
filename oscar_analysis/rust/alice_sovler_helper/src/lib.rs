@@ -287,13 +287,14 @@ fn search(
     mode: u8,
     radix: usize,
     digit_count: usize,
-) -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
+    max_solutions: usize,
+) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
     let mut perm = vec![0u8; n];
     let mut used = vec![false; digit_count];
     let mut assigned = vec![false; n];
-    let mut ops_valid = vec![Vec::new(); groups.len()];
     let var_order = variable_order(groups, n);
     let base = radix as i32;
+    let mut solutions: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
 
     fn dfs(
         depth: usize,
@@ -305,10 +306,12 @@ fn search(
         groups: &[OpGroup],
         mode: u8,
         base: i32,
-        ops_valid: &mut [Vec<u8>],
+        solutions: &mut Vec<(Vec<u8>, Vec<Vec<u8>>)>,
+        max_solutions: usize,
     ) -> bool {
         if depth == n {
-            // Verify all groups
+            // Verify all groups and collect valid ops.
+            let mut ops_valid = vec![Vec::new(); groups.len()];
             for (gi, g) in groups.iter().enumerate() {
                 let mut valid = Vec::new();
                 'cand: for &cand in &g.candidates {
@@ -324,7 +327,9 @@ fn search(
                 }
                 ops_valid[gi] = valid;
             }
-            return true;
+            // Record this solution; signal quota-reached so the caller can stop early.
+            solutions.push((perm.to_vec(), ops_valid));
+            return solutions.len() >= max_solutions;
         }
 
         let sym_idx = var_order[depth];
@@ -347,6 +352,7 @@ fn search(
                 used[d as usize] = false;
                 continue;
             }
+            // Propagate quota-reached signal upward to unwind early.
             if dfs(
                 depth + 1,
                 n,
@@ -357,8 +363,11 @@ fn search(
                 groups,
                 mode,
                 base,
-                ops_valid,
+                solutions,
+                max_solutions,
             ) {
+                assigned[sym_idx] = false;
+                used[d as usize] = false;
                 return true;
             }
             assigned[sym_idx] = false;
@@ -367,7 +376,7 @@ fn search(
         false
     }
 
-    if dfs(
+    dfs(
         0,
         n,
         &mut perm,
@@ -377,12 +386,10 @@ fn search(
         groups,
         mode,
         base,
-        &mut ops_valid,
-    ) {
-        Some((perm, ops_valid))
-    } else {
-        None
-    }
+        &mut solutions,
+        max_solutions,
+    );
+    solutions
 }
 
 fn variable_order(groups: &[OpGroup], n: usize) -> Vec<usize> {
@@ -536,10 +543,12 @@ fn search_with_stats(
 
 // ════════════════════ Python binding ════════════════════
 
-/// arithmetic_search(n, alice, groups, radix=None, digit_count=None) -> (perm, ops_valid) | None
+/// arithmetic_search(n, alice, groups, radix=None, digit_count=None, mode=None, max_solutions=1)
+///   -> list of (perm, ops_valid)   (empty list when no solution)
 /// groups: list of (candidates, equations)
 ///   candidates: list of u8 op indices
 ///   equations: list of [l0, l1, r0, r1, res_len, r0, r1, ...]
+/// max_solutions: stop after collecting this many distinct digit assignments (default 1).
 #[pyfunction]
 fn arithmetic_search(
     n: usize,
@@ -548,7 +557,8 @@ fn arithmetic_search(
     radix: Option<usize>,
     digit_count: Option<usize>,
     mode: Option<u8>,
-) -> PyResult<Option<(Vec<u8>, Vec<Vec<u8>>)>> {
+    max_solutions: Option<usize>,
+) -> PyResult<Vec<(Vec<u8>, Vec<Vec<u8>>)>> {
     let rust_groups: Vec<OpGroup> = groups
         .into_iter()
         .map(|(cands, eqs)| {
@@ -577,6 +587,7 @@ fn arithmetic_search(
         mode.unwrap_or(if alice { MODE_ALICE } else { MODE_STANDARD }),
         radix.unwrap_or(n),
         digit_count.unwrap_or(n),
+        max_solutions.unwrap_or(1),
     ))
 }
 

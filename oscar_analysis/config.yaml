@@ -1,0 +1,33 @@
+# Solver configuration
+# All fields are optional — defaults shown below.
+
+# Force base-10 arithmetic only (skips the natural base for puzzles with < 10 symbols).
+force_base_10: true
+
+# Python heuristics to bypass. Choose from:
+#   op_glyph_priority    (heuristic #3 — op ordering by glyph)
+#   sign_pattern_filter  (heuristic #2 — narrow by sign pattern)
+#   concat_optin         (heuristic #4 — structural concat check)
+#   order_ops            (heuristic #5 — MRV op ordering)
+#   tier_skip            (heuristic #9 — skip tiers with empty candidate groups)
+disabled_heuristics: []
+
+# Tiers to search, in order. Earlier tiers are tried first; the solver
+# backtracks to later (wider) tiers only when earlier ones yield no solution.
+# Choices: tier0, tier1, tier2, full
+tiers:
+  # - tier0
+  # - tier1
+  # - tier2
+  - full
+
+# Maximum distinct programs to collect per puzzle. The search escalates in order:
+#   1. distinct digit mappings (standard mode, primary base)
+#   2. little_endian strategy (same base)
+#   3. alternative base (when force_base_10 is false)
+# Finding fewer than max_solutions is fine — the search stops when exhausted.
+max_solutions: 10
+
+# Paths are relative to the project root.
+input_parquet: data/solver_results_base.parquet
+output_parquet: data/solver_results_forcing_base_10.parquet

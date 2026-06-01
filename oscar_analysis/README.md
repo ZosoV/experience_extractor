@@ -7,10 +7,10 @@ Solver for Alice's Wonderland `equation_symbolic` puzzles in the [NVIDIA NeMoTro
 ```text
 kaggle-nemotron-equation-symbolic/
 ├── src/
-│   ├── solver_eq_symbolic.py
-│   └── solve_all_symbolic.py
+│   └── solver_eq_symbolic.py
 ├── data/
-│   └──train.csv
+│   ├── solver_results_base.parquet
+│   └── train.csv
 ├── docs/
 │   └── index.html
 ├── main.py
@@ -30,13 +30,13 @@ uv run maturin develop --release
 ## Test
 
 ```bash
-uv run python main.py
+uv run python main.py --test
 ```
 
 ## Generate Solver Results
 
 ```bash
-uv run python src/solve_all_symbolic.py
+uv run python main.py
 ```
 
 Output:
@@ -63,11 +63,3 @@ Open:
 http://localhost:8000/docs/
 ```
 
-## Use
-
-```python
-from src.solver_eq_symbolic import AliceEquationSolver
-
-solver = AliceEquationSolver(prompt_text, answer_hint=gold_answer)
-answer, details = solver.solve()
-```
