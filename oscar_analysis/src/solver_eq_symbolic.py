@@ -75,6 +75,72 @@ _TIER_LABEL: dict[str, str] = {
 # Rust bridge
 # ---------------------------------------------------------------------------
 
+def _stage_seed(base_seed: int, content_syms: list[str], mode: str, radix: int) -> int:
+    """Derive a per-puzzle/per-stage seed from the base seed.
+
+    Mixes the base_seed with a stable (deterministic across Python processes) hash of the
+    symbol set, mode, and radix so that every (puzzle, mode, radix) triple gets a distinct
+    shuffle while remaining fully reproducible given the same base_seed.
+
+    Uses SHA-256 truncated to 64 bits for a stable, PYTHONHASHSEED-independent hash.
+    """
+    import hashlib
+    key = f"{','.join(content_syms)}|{mode}|{radix}".encode()
+    h = int.from_bytes(hashlib.sha256(key).digest()[:8], "little")
+    # xorshift mix to combine base_seed and h
+    s = (base_seed ^ (h * 0x9E3779B97F4A7C15)) & 0xFFFF_FFFF_FFFF_FFFF
+    return s
+
+
+def _candidate_seed(base_seed: int, content_syms: list[str], op_char: str) -> int:
+    """Derive a per-puzzle/per-operator seed for candidate-list shuffling.
+
+    Combines base_seed with a stable hash of the symbol set and operator character so
+    each (puzzle, operator) pair gets a distinct, reproducible shuffle regardless of
+    PYTHONHASHSEED.  Modeled on _stage_seed.
+    """
+    import hashlib
+    key = f"{','.join(content_syms)}|{op_char}".encode()
+    h = int.from_bytes(hashlib.sha256(key).digest()[:8], "little")
+    s = (base_seed ^ (h * 0x9E3779B97F4A7C15)) & 0xFFFF_FFFF_FFFF_FFFF
+    return s
+
+
+def _search_traced(
+    op_eqs: dict[str, list[tuple]],
+    tier_cands: dict[str, list[str]],
+    sorted_ops: list[str],
+    n: int,
+    mode: str,
+    radix: int,
+    digit_count: int,
+    max_solutions: int = 1,
+) -> tuple[list[tuple[list, list]], list[tuple[int, int, list, list]]]:
+    """Like _search but uses arithmetic_search_traced and returns (results, spine).
+
+    Always uses canonical weight-priority variable ordering (no randomize).
+    spine is a list of (sym_idx, accepted_digit, pruned, backtracked) — one entry
+    per symbol in the accepted assignment chain (first solution). Empty when no
+    solution is found. See cot_search_trace.py for the per-step rendering.
+    """
+    from alice_sovler_helper import arithmetic_search_traced  # type: ignore[import]
+
+    mode_int = 0 if mode == "standard" else 2
+
+    groups = []
+    for op_char in sorted_ops:
+        cand_indices = [OP_NAME_TO_IDX[name] for name in tier_cands[op_char]]
+        eqs_packed = []
+        for l0, l1, r0, r1, res_syms, has_sign, res_len in op_eqs[op_char]:
+            packed = [l0, l1, r0, r1, res_len, int(has_sign)] + list(res_syms)
+            eqs_packed.append(packed)
+        groups.append((cand_indices, eqs_packed))
+
+    return arithmetic_search_traced(
+        n, False, groups, radix, digit_count, mode_int, max_solutions
+    )
+
+
 def _search(
     op_eqs: dict[str, list[tuple]],
     tier_cands: dict[str, list[str]],
@@ -84,6 +150,8 @@ def _search(
     radix: int,
     digit_count: int,
     max_solutions: int = 1,
+    randomize: bool = False,
+    seed: int = 0,
 ) -> list[tuple[list, list]]:
     """Call the Rust arithmetic_search core and return a list of (perm, ops_valid) tuples.
 
@@ -99,6 +167,9 @@ def _search(
         radix:          positional base for arithmetic
         digit_count:    digit pool size (== radix for normal case)
         max_solutions:  stop after collecting this many digit assignments
+        randomize:      when True, shuffle symbol-assignment and digit-iteration orders
+                        inside the Rust DFS using the seeded PRNG (see seed)
+        seed:           seed for the xorshift64 PRNG used when randomize=True
     """
     from alice_sovler_helper import arithmetic_search  # type: ignore[import]
 
@@ -113,18 +184,21 @@ def _search(
             eqs_packed.append(packed)
         groups.append((cand_indices, eqs_packed))
 
-    return arithmetic_search(n, False, groups, radix, digit_count, mode_int, max_solutions)
+    return arithmetic_search(
+        n, False, groups, radix, digit_count, mode_int, max_solutions, randomize, seed
+    )
 
 
 # ---------------------------------------------------------------------------
 # Concat fast-path (spec §2.2)
 # ---------------------------------------------------------------------------
 
-def _try_concat(equations: list[dict]) -> str | None:
+def _try_concat(equations: list[dict]) -> tuple[str, str] | None:
     """Check whether every equation with the query's operator is pure concat.
 
-    Returns the answer string if the puzzle is solved by concatenation,
-    or None to fall through to arithmetic search.
+    Returns ``(answer, op_name)`` if the puzzle is solved by concatenation,
+    where ``op_name`` is ``"concat_fwd"`` or ``"concat_rev"``, or ``None`` to
+    fall through to arithmetic search.
     """
     to_predict = equations[-1]
     op_of_interest = to_predict["lhs"]["op"]
@@ -135,7 +209,10 @@ def _try_concat(equations: list[dict]) -> str | None:
     if len(to_predict["rhs"]["actual_rhs"]) != 4:
         return None
 
-    relevant = [eq for eq in equations if eq["lhs"]["op"] == op_of_interest]
+    # Only use example equations (not to_predict itself) as evidence.
+    relevant = [eq for eq in equations[:-1] if eq["lhs"]["op"] == op_of_interest]
+    if not relevant:
+        return None
 
     # Try forward concat: rhs == [l0, l1, r0, r1]
     fwd_ok = True
@@ -147,7 +224,7 @@ def _try_concat(equations: list[dict]) -> str | None:
             break
     if fwd_ok:
         q = to_predict["lhs"]
-        return q["l0"] + q["l1"] + q["r0"] + q["r1"]
+        return q["l0"] + q["l1"] + q["r0"] + q["r1"], "concat_fwd"
 
     # Try reverse concat: rhs == [r0, r1, l0, l1]
     rev_ok = True
@@ -159,7 +236,7 @@ def _try_concat(equations: list[dict]) -> str | None:
             break
     if rev_ok:
         q = to_predict["lhs"]
-        return q["r0"] + q["r1"] + q["l0"] + q["l1"]
+        return q["r0"] + q["r1"] + q["l0"] + q["l1"], "concat_rev"
 
     return None
 
@@ -174,8 +251,8 @@ def _try_arithmetic(
     sym2i: dict[str, int],
     gold_answer: str,
     config: SolverConfig,
-) -> tuple[list[tuple[str, dict]], str | None]:
-    """Run the tiered arithmetic search and return (solutions, search_reached).
+) -> tuple[list[tuple[str, dict]], str | None, str | None]:
+    """Run the tiered arithmetic search and return (solutions, search_reached, search_cot).
 
     The to_predict equation (last in equations) is included as a constraint
     so the search is gold-conditioned.
@@ -191,11 +268,18 @@ def _try_arithmetic(
       'little_endian'— advanced into little_endian (same base)
       'alt_base'     — advanced into a non-primary base
 
-    Returns ([], None) when no solution is found, falling back to
-    ([first_partial], None) when a partial candidate exists (encode_answer
+    search_cot is a prose chain-of-thought narrating the search path to the first
+    solution (both Python-layer decisions and the Rust DFS trace). None when
+    config.generate_cot is False or no solution was found.
+
+    Returns ([], None, None) when no solution is found, falling back to
+    ([first_partial], None, None) when a partial candidate exists (encode_answer
     succeeded but verify failed), so the caller can surface it as wrong_answer.
     """
     base = len(content_syms)
+
+    # Accumulate Python-layer narration events when CoT is enabled.
+    py_events: list[dict] = []
 
     # Step A: Build operator groups (includes to_predict as a constraint).
     op_eqs = build_op_groups(equations, sym2i)
@@ -205,21 +289,66 @@ def _try_arithmetic(
     for op_char, eqs in op_eqs.items():
         if "op_glyph_priority" not in config.disabled_heuristics:
             cands = op_glyph_priority(op_char)        # #3
+            initial_cands = list(cands)
         else:
             cands = list(OPERATIONS.keys())
+            initial_cands = list(cands)
 
+        changes: list[str] = []
         if "sign_pattern_filter" not in config.disabled_heuristics:
+            before = len(cands)
             cands = sign_pattern_filter(cands, eqs)   # #2
+            if len(cands) != before:
+                changes.append(f"sign_pattern_filter ({before}→{len(cands)})")
         if "concat_optin" not in config.disabled_heuristics:
+            before = len(cands)
             cands = concat_optin(cands, eqs)           # #4
+            if len(cands) != before:
+                changes.append(f"concat_optin ({before}→{len(cands)})")
 
         op_candidates[op_char] = cands
+        if config.generate_cot:
+            py_events.append({
+                "type": "candidates",
+                "op_char": op_char,
+                "initial": initial_cands,
+                "final": list(cands),
+                "changes": changes,
+            })
+
+    # Step B': drop operations excluded via config.
+    if config.filter_out_operations:
+        blocked = set(config.filter_out_operations)
+        op_candidates = {
+            op: [c for c in cands if c not in blocked]
+            for op, cands in op_candidates.items()
+        }
+
+    # Step B'': randomize candidate priority order (optional).
+    if config.randomize_candidates:
+        import random
+        op_candidates = {
+            op: random.Random(
+                _candidate_seed(config.random_seed, content_syms, op)
+            ).sample(cands, len(cands))
+            for op, cands in op_candidates.items()
+        }
 
     # Step C: Op ordering.
     if "order_ops" not in config.disabled_heuristics:
         sorted_ops = order_ops(op_eqs, op_candidates)  # #5
     else:
         sorted_ops = list(op_eqs.keys())
+
+    if config.generate_cot:
+        py_events.append({
+            "type": "order_ops",
+            "order": list(sorted_ops),
+            "stats": [
+                (op, len(op_candidates.get(op, [])), len(op_eqs.get(op, [])))
+                for op in sorted_ops
+            ],
+        })
 
     # Steps D/E: Tiered search loop.
     tiers_to_try = [(name, _TIER_SETS[name]) for name in config.tiers]
@@ -235,6 +364,13 @@ def _try_arithmetic(
     # Track the furthest escalation stage the loop advances into.
     search_reached: str | None = None
 
+    # For CoT: capture the Rust spine from the first stage that yields a solution.
+    cot_spine: list[tuple[int, int, list, list]] = []
+    cot_stage_mode: str = "standard"
+    cot_stage_radix: int = 10
+    cot_stage_tier: str | None = None
+    cot_first_solution: dict | None = None  # details dict of the traced solution
+
     for tier_name, tier_set in tiers_to_try:
         if len(solutions) >= config.max_solutions:
             break
@@ -245,6 +381,17 @@ def _try_arithmetic(
         }
 
         if "tier_skip" not in config.disabled_heuristics and tier_skip(tier_cands):  # #9
+            if config.generate_cot:
+                # Find which op caused the skip (first empty group).
+                empty_op = next(
+                    (op for op, cs in tier_cands.items() if not cs), None
+                )
+                if empty_op:
+                    py_events.append({
+                        "type": "tier_skip",
+                        "tier": tier_name,
+                        "op_char": empty_op,
+                    })
             continue
 
         if config.force_base_10:
@@ -277,11 +424,39 @@ def _try_arithmetic(
                     ) or search_reached is None:
                         search_reached = stage
 
+                if config.generate_cot:
+                    py_events.append({
+                        "type": "stage_enter",
+                        "tier": tier_name,
+                        "mode": mode,
+                        "radix": radix,
+                    })
+
                 remaining = config.max_solutions - len(solutions)
-                results = _search(
-                    op_eqs, tier_cands, sorted_ops, base, mode, radix, digit_count,
-                    max_solutions=remaining,
+                stage_quota = remaining
+                mdt = (
+                    config.max_digit_trials_little_endian
+                    if mode == "little_endian"
+                    else config.max_digit_trials_standard
                 )
+                if mdt is not None:
+                    stage_quota = min(remaining, mdt)
+
+                # Use the traced search for the first solution-producing stage when CoT
+                # is enabled AND we haven't yet captured the spine for this puzzle.
+                stage_spine: list = []
+                if config.generate_cot and not cot_spine:
+                    results, stage_spine = _search_traced(
+                        op_eqs, tier_cands, sorted_ops, base, mode, radix, digit_count,
+                        max_solutions=stage_quota,
+                    )
+                else:
+                    results = _search(
+                        op_eqs, tier_cands, sorted_ops, base, mode, radix, digit_count,
+                        max_solutions=stage_quota,
+                        randomize=config.randomize_search,
+                        seed=_stage_seed(config.random_seed, content_syms, mode, radix),
+                    )
 
                 for perm, ops_valid_indices in results:
                     # Decode mapping: symbol -> digit.
@@ -342,16 +517,56 @@ def _try_arithmetic(
 
                     seen.add(dedup_key)
                     solutions.append((answer_str, details))
+                    # Capture CoT spine on the first verified solution from the traced stage.
+                    if (
+                        config.generate_cot
+                        and stage_spine
+                        and not cot_spine
+                        and len(solutions) == 1
+                    ):
+                        cot_spine = list(stage_spine)
+                        cot_stage_mode = mode
+                        cot_stage_radix = radix
+                        cot_stage_tier = tier_name
+                        cot_first_solution = details
                     if len(solutions) >= config.max_solutions:
                         break
 
+                if config.generate_cot:
+                    py_events.append({
+                        "type": "stage_result",
+                        "tier": tier_name,
+                        "mode": mode,
+                        "radix": radix,
+                        "n_solutions": len(results),
+                    })
+
+    # Render the search CoT if enabled.
+    search_cot: str | None = None
+    if config.generate_cot and solutions:
+        from src.cot_search_trace import render_search_cot
+        first_details = cot_first_solution or solutions[0][1]
+        search_cot = render_search_cot(
+            py_events=py_events,
+            spine=cot_spine,
+            content_syms=content_syms,
+            sorted_ops=sorted_ops,
+            digits_mapping=first_details.get("digits_mapping"),
+            ops_mapping=first_details.get("ops_mapping"),
+            mode=cot_stage_mode,
+            radix=cot_stage_radix,
+            tier=cot_stage_tier,
+            ops_candidates=first_details.get("ops_candidates"),
+            op_eqs=op_eqs,
+        )
+
     if solutions:
-        return solutions, search_reached
+        return solutions, search_reached, search_cot
 
     # No fully-verified solution found; return the first partial as wrong_answer.
     if first_partial is not None:
-        return [first_partial], None
-    return [], None
+        return [first_partial], None, None
+    return [], None, None
 
 
 # ---------------------------------------------------------------------------
@@ -379,30 +594,43 @@ def solve_sample(row: dict, config: SolverConfig) -> list[dict]:
     sym2i = {s: i for i, s in enumerate(syms)}
 
     # Concat fast-path.
-    concat_ans = _try_concat(equations)
-    if concat_ans is not None:
+    concat_result = None if config.disable_concat_fastpath else _try_concat(equations)
+    if concat_result is not None:
+        concat_ans, concat_op = concat_result
+        op_glyph = equations[-1]["lhs"]["op"]
+        concat_cot: str | None = None
+        if config.generate_cot:
+            from src.cot_search_trace import render_concat_cot
+            concat_cot = render_concat_cot(op_glyph, concat_op, concat_ans)
         return [{
             "solver_answer": concat_ans,
             "solver_correct": concat_ans == gold_answer,
             "solver_strategy": "pure_concat",
             "category": "concatenation",
-            "ops_mapping": None,
+            "ops_mapping": {op_glyph: concat_op},
             "digits_mapping": None,
             "solver_tier": None,
             "solver_radix": None,
             "ops_candidates": None,
             "equations": equations,
             "solution_count": 1,
+            "standard_solution_count": 0,
+            "little_endian_solution_count": 0,
             "search_reached": None,
+            "search_cot": concat_cot,
         }]
 
     # Arithmetic search.
-    solutions, search_reached = _try_arithmetic(equations, syms, sym2i, gold_answer, config)
+    solutions, search_reached, search_cot = _try_arithmetic(
+        equations, syms, sym2i, gold_answer, config
+    )
 
     if not solutions:
         return [_no_solution(equations=equations)]
 
     solution_count = len(solutions)
+    standard_solution_count = sum(1 for _, d in solutions if d.get("solver_strategy") == "standard")
+    little_endian_solution_count = sum(1 for _, d in solutions if d.get("solver_strategy") == "little_endian")
     result_dicts: list[dict] = []
     for answer_str, details in solutions:
         verify_failed = details.pop("_verify_failed", False)
@@ -414,7 +642,10 @@ def solve_sample(row: dict, config: SolverConfig) -> list[dict]:
             "category": "arithmetic",
             "equations": equations,
             "solution_count": solution_count if not verify_failed else 0,
+            "standard_solution_count": standard_solution_count if not verify_failed else 0,
+            "little_endian_solution_count": little_endian_solution_count if not verify_failed else 0,
             "search_reached": search_reached if not verify_failed else None,
+            "search_cot": search_cot if not verify_failed else None,
         })
     return result_dicts
 
@@ -432,7 +663,10 @@ def _no_solution(equations: list, error: str | None = None) -> dict:
         "ops_candidates": None,
         "equations": equations,
         "solution_count": 0,
+        "standard_solution_count": 0,
+        "little_endian_solution_count": 0,
         "search_reached": None,
+        "search_cot": None,
     }
 
 
@@ -479,13 +713,14 @@ def main() -> None:
         # Emit one record per solution (multiple rows per puzzle when solutions > 1).
         for res in result_list:
             records.append({
-                "id": row.get("id"),
+                "problem_id": row.get("problem_id"),
                 "prompt": row.get("prompt"),
                 "answer": gold,
                 "solver_answer": res["solver_answer"],
                 "solver_correct": res["solver_correct"],
                 "solver_strategy": res["solver_strategy"],
-                "category": res["category"],
+                "solver_category": res["category"],
+                "problem_category": row.get("problem_category"),
                 "ops_mapping": _to_json(res["ops_mapping"]),
                 "digits_mapping": _to_json(res["digits_mapping"]),
                 "solver_tier": res["solver_tier"],
@@ -493,10 +728,23 @@ def main() -> None:
                 "ops_candidates": _to_json(res["ops_candidates"]),
                 "equations": _to_json(res["equations"]),
                 "solution_count": res["solution_count"],
-                "search_reached": res["search_reached"],
+                "standard_solution_count": res["standard_solution_count"],
+                "little_endian_solution_count": res["little_endian_solution_count"],
+                "search_cot": res.get("search_cot"),
             })
 
     out_df = pd.DataFrame(records)
+    # Assign per-puzzle sequential solution index and enforce column order.
+    out_df["solution_id"] = out_df.groupby("problem_id").cumcount()
+    _COLUMNS = [
+        "problem_id", "solution_id", "prompt", "answer",
+        "solver_answer", "solver_correct", "solver_strategy", "solver_category", "problem_category",
+        "ops_mapping", "digits_mapping", "solver_tier", "solver_radix", "ops_candidates",
+        "equations",
+        "solution_count", "standard_solution_count", "little_endian_solution_count",
+        "search_cot",
+    ]
+    out_df = out_df[_COLUMNS]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_parquet(output_path, index=False)
 

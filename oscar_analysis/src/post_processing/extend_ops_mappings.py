@@ -95,10 +95,12 @@ def _expand_row(row: pd.Series) -> list[dict]:
 
     # Columns carried unchanged to every variant.
     base: dict = {
-        "id":              row.get("id"),
+        "problem_id":      row.get("problem_id"),
         "prompt":          row.get("prompt"),
         "answer":          row.get("answer"),
         "solver_strategy": row.get("solver_strategy"),
+        "solver_category": row.get("solver_category"),
+        "problem_category": row.get("problem_category"),
         "digits_mapping":  row.get("digits_mapping"),
         "solver_tier":     row.get("solver_tier"),
         "solver_radix":    row.get("solver_radix"),
@@ -241,11 +243,13 @@ def main() -> None:
         all_rows.extend(_expand_row(row))
 
     out_df = pd.DataFrame(all_rows)
+    # Re-assign solution_id after variant expansion (row count per puzzle changes).
+    out_df["solution_id"] = out_df.groupby("problem_id").cumcount()
 
     # --- Summary ---
     total_in  = len(df)
     total_out = len(out_df)
-    per_puzzle = out_df.groupby("id")["num_variants"].first()
+    per_puzzle = out_df.groupby("problem_id")["num_variants"].first()
     multi      = int((per_puzzle > 1).sum())
     mean_var   = per_puzzle.mean()
 
@@ -265,7 +269,7 @@ def main() -> None:
     if failed_val:
         print(f"\n  ⚠  variants failing full verification : {failed_val}")
         print(evaled[evaled["fully_validated"] == False][  # noqa: E712
-            ["id", "variant_index", "ops_mapping", "solver_answer", "answer"]
+            ["problem_id", "variant_index", "ops_mapping", "solver_answer", "answer"]
         ].to_string(index=False))
     else:
         print("fully_validated failures    : 0  ✓")
@@ -273,7 +277,7 @@ def main() -> None:
     if failed_corr:
         print(f"\n  ⚠  arithmetic variants with wrong solver_answer : {failed_corr}")
         print(evaled[evaled["solver_correct"] == False][  # noqa: E712
-            ["id", "variant_index", "ops_mapping", "solver_answer", "answer"]
+            ["problem_id", "variant_index", "ops_mapping", "solver_answer", "answer"]
         ].to_string(index=False))
     else:
         print("solver_correct failures     : 0  ✓")

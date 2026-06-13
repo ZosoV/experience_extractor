@@ -77,11 +77,14 @@ On construction:
 
 For each sample, take the last equation corresponding to equation that is expected to be predicted.
 
-1. Take the op symbol of the lhs on the last equation. This is our op_of_interest
-2. If there is not op in rhs and rhs contains 4 symbols:
-  - For every equation with the op = op_of_interest:
-    - Check if the solution corresponds to a simple forward concatenation (`l0l1r0r1`) or reverse concatenation (`r0r1l0l1`) between the symbols. NOTE: if a question doesn't fit on this concatenation end the loop early.
-  - If all the equations pass the check, this problem is solved with concatenation and record it's solution.
+1. Take the op symbol of the lhs on the last equation. This is our op_of_interest.
+2. If there is no op in rhs and rhs contains exactly 4 symbols:
+  - Collect all **example** equations (i.e. all equations except `to_predict`) whose op equals `op_of_interest`. If none exist, **abort and fall through to arithmetic search** — `to_predict` alone is not sufficient evidence.
+  - For every collected example equation:
+    - Check if the solution corresponds to a simple forward concatenation (`l0l1r0r1`) or reverse concatenation (`r0r1l0l1`) between the symbols. If any equation fails both checks, abort early.
+  - If all examples pass the same check, the problem is solved with concatenation; record the solution.
+
+**Evidence requirement:** at least one example equation must share `op_of_interest` for the fast-path to trigger. Dataset analysis (824 problems) found 16 cases where `to_predict`'s operator never appears in examples; those are now routed to arithmetic search. Of the remaining 60 concat problems, all show perfectly consistent direction (0 wrong inferences).
 
 ### 2.4 Arithmetic Search — `_try_arithmetic()`
 
@@ -213,9 +216,9 @@ The `details` dict in the successful return carries:
 ## 3. Rust Search Core
 
 Python's `_search` packages the call and invokes `arithmetic_search` in
-`lib.rs:544`.
+`lib.rs:615`.
 
-### Signature (`lib.rs:544-581`)
+### Signature (`lib.rs:615-660`)
 
 ```rust
 fn arithmetic_search(
@@ -225,25 +228,28 @@ fn arithmetic_search(
     radix: Option<usize>,                       // positional base for arithmetic; default n
     digit_count: Option<usize>,                 // size of the digit pool; default n
     mode: Option<u8>,                           // 0=standard, 1=alice, 2=little_endian
-) -> Option<(Vec<u8>, Vec<Vec<u8>>)>
+    max_solutions: Option<usize>,
+    randomize: Option<bool>,
+    seed: Option<u64>,
+) -> Vec<(Vec<u8>, Vec<Vec<u8>>)>
 ```
 
 Each equation is encoded as `[l0, l1, r0, r1, res_len, has_sign, res_syms…]`.
 
-### Algorithm (`search` / `dfs`, `lib.rs:284-386`)
+### Algorithm (`search` / `dfs`, `lib.rs:319-452`)
 
 1. Compute `var_order = variable_order(groups, n)` — symbol assignment order (Heuristic #1).
 2. Initialise state: `perm[sym] = digit`, `used[0..digit_count]` (bijection enforcer),
    `assigned[sym]` (which symbols have been assigned so far).
 3. DFS: at depth `d`, take `sym = var_order[d]`; try each digit `d in 0..digit_count` not
    yet in `used`; tentatively set `perm[sym] = d, used[d] = true, assigned[sym] = true`.
-4. **Forward-check** (`group_has_candidate_for_assigned_eqs`, `:266-282`): for every group,
-   check equations whose symbols are *all* assigned (`eq_is_assigned`, `:184-199`); a
+4. **Forward-check** (`group_has_candidate_for_assigned_eqs`, `lib.rs:301`): for every group,
+   check equations whose symbols are *all* assigned (`eq_is_assigned`, `lib.rs:220`); a
    candidate survives if it matches every such equation; if a group has zero survivors →
    undo, try next digit (prune this branch).
 5. If forward-check passes, recurse to depth `d+1`.
-6. **Leaf** (`depth == n`, `:310-327`): re-verify every candidate against every equation in
-   its group; collect survivors; if every group has ≥1 survivor, return `(perm, ops_valid)`.
+6. **Leaf** (`depth == n`, `lib.rs:369`): re-verify every candidate against every equation in
+   its group; collect survivors; if every group has ≥1 survivor, push `(perm, ops_valid)` to solutions.
 
 ### Return value
 
@@ -268,14 +274,14 @@ Each equation is encoded as `[l0, l1, r0, r1, res_len, has_sign, res_syms…]`.
 **`digit_count` is the size of the digit *alphabet* the mapping draws from — not a way to
 shrink the mapping below the number of symbols.**
 
-In Rust, `used = vec![false; digit_count]` (`:292`) and the assignment loop is
-`for d in 0..used.len()` (`:331`). So each symbol is assigned a **unique** value from the
+In Rust, `used = vec![false; digit_count]` (`lib.rs:330`) and the assignment loop is
+`for &d in digit_order` (`lib.rs:393`). So each symbol is assigned a **unique** value from the
 pool `{0, 1, …, digit_count − 1}`. `used` enforces the injection (no digit reused).
 
 `radix` is the **positional base** for arithmetic: `L = perm[l0]*base + perm[l1]`.
 It governs the math, not which digits exist.
 
-Both default to `n` (`:578-579`).
+Both default to `n` (`lib.rs:654-655`).
 
 | `digit_count` vs `n` | Meaning |
 |---|---|
@@ -456,22 +462,28 @@ output_parquet: data/solver_results.parquet
 
 ## 8. Output Format — `solver_results.parquet`
 
-One row per input sample. Columns:
+One row per solution found (multi-row per puzzle when `solution_count > 1`). Columns:
 
 | Column | Type | Description |
 |---|---|---|
-| `id` | str | Sample identifier |
+| `problem_id` | str | Sample identifier (from input parquet) |
+| `solution_id` | int | Per-puzzle sequential index (0, 1, 2 …) |
 | `prompt` | str | Original puzzle prompt |
 | `answer` | str | Gold answer |
+| `problem_category` | str\|null | High-level puzzle domain (from input parquet) |
 | `solver_answer` | str\|null | Solver-produced answer |
 | `solver_correct` | bool | `solver_answer == answer` |
-| `solver_strategy` | str\|null | `pure_concat`, `arithmetic`, or `little_endian` |
+| `solver_category` | str\|null | Solver-assigned family: `arithmetic` or `concatenation` |
+| `solver_strategy` | str\|null | `pure_concat`, `standard`, or `little_endian` |
 | `ops_mapping` | json\|null | `{op_char: op_name}` — first surviving candidate per operator |
 | `digits_mapping` | json\|null | `{symbol: digit}` — content symbol to digit mapping |
 | `solver_tier` | str\|null | Tier that yielded the solution: `tier0…full` |
 | `solver_radix` | int\|null | Positional base used for arithmetic |
 | `ops_candidates` | json\|null | `{op_char: [op_names]}` — all surviving candidates |
-| `equations` | json\|null | List of structured equation dicts (all examples + to_predict) |
+| `equations` | json\|null | Retained for post-processing; not in final CoT dataset |
+| `solution_count` | int | Total distinct solutions found (`0` = no solution) |
+| `standard_solution_count` | int | Solutions found under `standard` mode |
+| `little_endian_solution_count` | int | Solutions found under `little_endian` mode |
 
 No-solution rows have null for all `solver_*` columns except `solver_correct = false`.
 
@@ -490,4 +502,64 @@ When reimplementing, validate against the current results:
 
 Zero wrong answers is the hard constraint — when the solver returns an answer it is verified
 against the full program. Run:
+
+---
+
+## 10. Search-Trace CoT (`generate_cot`)
+
+When `config.generate_cot = True`, the solver generates a prose narration of the search
+process for each solved puzzle and saves it in the `search_cot` parquet column.
+
+### Config flag
+
+`generate_cot: bool = False` in `src/config.py` / `config.yaml`. When false, no traced search
+runs and `search_cot` is `None` for every row (zero overhead).
+
+### Two instrumented entry points
+
+**Python layer** — `_try_arithmetic` (`src/solver_eq_symbolic.py`) accumulates `py_events`
+as it makes decisions:
+- `candidates` event: per operator glyph, which heuristics narrowed the candidate list and to
+  what (heuristics #2 `sign_pattern_filter`, #3 `op_glyph_priority`, #4 `concat_optin`).
+- `tier_skip` event: which tier was skipped because an operator group was empty (heuristic #9).
+- `stage_enter` / `stage_result` events: which tier/mode/radix was tried and whether
+  it produced results.
+
+**Rust layer** — `search_traced` / `arithmetic_search_traced` (`lib.rs:620` / `lib.rs:889`) is
+called instead of `arithmetic_search` for each stage until the first solution is found. It
+emits an ordered event log alongside the solutions:
+
+| kind | Name | Meaning | `aux` field |
+|------|------|---------|-------------|
+| 0 | TRY | About to test `digit` for `sym_idx` | — |
+| 1 | PRUNE | Forward-check failed (`lib.rs:707`) | failing group index |
+| 2 | RECURSE | Forward-check passed, descending (`lib.rs:715`) | — |
+| 3 | BACKTRACK | Subtree returned no solution (`lib.rs:739`) | — |
+| 4 | LEAF_REJECT | All symbols bound, a group has no valid op (`lib.rs:668`) | failing group index |
+| 5 | SOLUTION | Full assignment accepted (`lib.rs:676`) | — |
+
+Events are only recorded **up to and including the first SOLUTION**; after that `trace_done`
+is set and the search continues silently to collect up to `max_solutions`. Always uses
+canonical weight-priority variable ordering (`variable_order`, `lib.rs:454`) regardless of
+`randomize_search`.
+
+### Renderer
+
+`src/cot_search_trace.py` — pure functions, no side effects.
+
+- `render_search_cot(py_events, rust_events, content_syms, sorted_ops, digits_mapping,
+  ops_mapping, mode, radix, tier) -> str`
+- `render_concat_cot(op_glyph, op_name, answer) -> str` for concat fast-path puzzles.
+
+The output has three sections:
+1. **[Candidate setup and search strategy]** — Python-layer events in prose.
+2. **[Digit-assignment DFS]** — Rust events indented by depth; TRY events are emitted in
+   Rust but skipped by the renderer (PRUNE/RECURSE carry the same `sym`/`digit` info).
+3. **[Result]** — digit assignment and operator resolution summary.
+
+### Column threading
+
+`search_cot` is threaded from `_try_arithmetic` → `solve_sample` → `main` exactly as
+`search_reached` is today. It appears in `_COLUMNS` (`src/solver_eq_symbolic.py`) as a plain
+string (no JSON encoding). `_no_solution` sets it to `None`.
 

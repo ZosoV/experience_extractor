@@ -4,6 +4,41 @@ const MODE_STANDARD: u8 = 0;
 const MODE_ALICE: u8 = 1;
 const MODE_LITTLE_ENDIAN: u8 = 2;
 
+// ════════════════════ Seeded PRNG (xorshift64) ════════════════════
+
+/// Minimal xorshift64 PRNG — no external crate needed.
+/// Produces a non-zero state; if seed is 0 we use a fixed non-zero constant.
+struct Xorshift64 {
+    state: u64,
+}
+
+impl Xorshift64 {
+    fn new(seed: u64) -> Self {
+        // xorshift requires non-zero state; use a mixing constant as fallback.
+        let state = if seed == 0 { 0x853C_49E6_748F_EA9B } else { seed };
+        Self { state }
+    }
+
+    #[inline(always)]
+    fn next(&mut self) -> u64 {
+        let mut x = self.state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.state = x;
+        x
+    }
+
+    /// Fisher–Yates in-place shuffle of a slice.
+    fn shuffle<T>(&mut self, slice: &mut [T]) {
+        let n = slice.len();
+        for i in (1..n).rev() {
+            let j = (self.next() as usize) % (i + 1);
+            slice.swap(i, j);
+        }
+    }
+}
+
 // ════════════════════ Operations ════════════════════
 
 #[inline(always)]
@@ -288,11 +323,32 @@ fn search(
     radix: usize,
     digit_count: usize,
     max_solutions: usize,
+    randomize: bool,
+    seed: u64,
 ) -> Vec<(Vec<u8>, Vec<Vec<u8>>)> {
     let mut perm = vec![0u8; n];
     let mut used = vec![false; digit_count];
     let mut assigned = vec![false; n];
-    let var_order = variable_order(groups, n);
+
+    // Build symbol-assignment order and digit-iteration order.
+    // When randomize=true, shuffle both using the seeded PRNG instead of the
+    // default weight-priority symbol ordering.
+    let mut rng = Xorshift64::new(seed);
+    let var_order = if randomize {
+        let mut order: Vec<usize> = (0..n).collect();
+        rng.shuffle(&mut order);
+        order
+    } else {
+        variable_order(groups, n)
+    };
+    let digit_order: Vec<u8> = if randomize {
+        let mut order: Vec<u8> = (0..digit_count as u8).collect();
+        rng.shuffle(&mut order);
+        order
+    } else {
+        (0..digit_count as u8).collect()
+    };
+
     let base = radix as i32;
     let mut solutions: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
 
@@ -303,6 +359,7 @@ fn search(
         used: &mut [bool],
         assigned: &mut [bool],
         var_order: &[usize],
+        digit_order: &[u8],
         groups: &[OpGroup],
         mode: u8,
         base: i32,
@@ -333,7 +390,7 @@ fn search(
         }
 
         let sym_idx = var_order[depth];
-        for d in 0..used.len() as u8 {
+        for &d in digit_order {
             if used[d as usize] {
                 continue;
             }
@@ -360,6 +417,7 @@ fn search(
                 used,
                 assigned,
                 var_order,
+                digit_order,
                 groups,
                 mode,
                 base,
@@ -383,6 +441,7 @@ fn search(
         &mut used,
         &mut assigned,
         &var_order,
+        &digit_order,
         groups,
         mode,
         base,
@@ -541,15 +600,157 @@ fn search_with_stats(
     }
 }
 
+// ════════════════════ Traced search ════════════════════
+
+/// Spine entry for one symbol in the accepted assignment chain.
+/// `(sym_idx, accepted_digit, pruned, backtracked)`
+///   pruned:      digits ruled out by forward-checking at this depth, with the first
+///                group index that lost all candidates: `(digit, group_idx)`.
+///   backtracked: digits that passed forward-checking but whose entire subtree failed.
+type SpineEntry = (u8, u8, Vec<(u8, i32)>, Vec<u8>);
+
+/// search_traced — returns all solutions (like search) PLUS a compact spine describing
+/// the path the DFS took to reach the *first* solution.
+///
+/// The spine has one entry per symbol in assignment order (most-constrained first).
+/// Each entry records which digits were rejected before the accepted one and why,
+/// keeping the description to O(n × digit_count) entries regardless of tree size.
+///
+/// Always uses canonical weight-priority variable ordering (no randomise option).
+fn search_traced(
+    groups: &[OpGroup],
+    n: usize,
+    mode: u8,
+    radix: usize,
+    digit_count: usize,
+    max_solutions: usize,
+) -> (Vec<(Vec<u8>, Vec<Vec<u8>>)>, Vec<SpineEntry>) {
+    let var_order = variable_order(groups, n);
+    let digit_order: Vec<u8> = (0..digit_count as u8).collect();
+    let base = radix as i32;
+
+    // --- Step 1: run DFS limited to 1 solution to build the spine ---
+    let mut perm  = vec![0u8; n];
+    let mut used  = vec![false; digit_count];
+    let mut assigned = vec![false; n];
+    let mut spine_sols: Vec<(Vec<u8>, Vec<Vec<u8>>)> = Vec::new();
+    let mut spine: Vec<SpineEntry> = Vec::new();
+
+    fn dfs_spine(
+        depth: usize,
+        n: usize,
+        perm: &mut [u8],
+        used: &mut [bool],
+        assigned: &mut [bool],
+        var_order: &[usize],
+        digit_order: &[u8],
+        groups: &[OpGroup],
+        mode: u8,
+        base: i32,
+        solutions: &mut Vec<(Vec<u8>, Vec<Vec<u8>>)>,
+        spine: &mut Vec<SpineEntry>,
+    ) -> bool {
+        if depth == n {
+            // Leaf: verify all groups.
+            let mut ops_valid = vec![Vec::new(); groups.len()];
+            for (gi, g) in groups.iter().enumerate() {
+                let mut valid = Vec::new();
+                'cand: for &cand in &g.candidates {
+                    for eq in &g.eqs {
+                        if !candidate_matches_eq(cand, eq, perm, mode, base) {
+                            continue 'cand;
+                        }
+                    }
+                    valid.push(cand);
+                }
+                if valid.is_empty() {
+                    let _ = gi; // suppress unused warning; not recorded in spine leaf
+                    return false;
+                }
+                ops_valid[gi] = valid;
+            }
+            solutions.push((perm.to_vec(), ops_valid));
+            return true; // stop after first solution
+        }
+
+        let sym_idx = var_order[depth];
+        let mut pruned_here:      Vec<(u8, i32)> = Vec::new();
+        let mut backtracked_here: Vec<u8>         = Vec::new();
+
+        for &d in digit_order {
+            if used[d as usize] { continue; }
+            used[d as usize]  = true;
+            assigned[sym_idx] = true;
+            perm[sym_idx]     = d;
+
+            let mut still_possible = true;
+            let mut failed_group: i32 = -1;
+            for (gi, g) in groups.iter().enumerate() {
+                if !group_has_candidate_for_assigned_eqs(g, perm, mode, base, assigned) {
+                    still_possible = false;
+                    failed_group   = gi as i32;
+                    break;
+                }
+            }
+
+            if !still_possible {
+                pruned_here.push((d, failed_group));
+                assigned[sym_idx]  = false;
+                used[d as usize]   = false;
+                continue;
+            }
+
+            if dfs_spine(depth + 1, n, perm, used, assigned, var_order, digit_order,
+                         groups, mode, base, solutions, spine) {
+                // This digit leads to the first solution — record spine entry and unwind.
+                spine.push((sym_idx as u8, d, pruned_here, backtracked_here));
+                assigned[sym_idx] = false;
+                used[d as usize]  = false;
+                return true;
+            }
+
+            // Subtree failed — record as dead end.
+            backtracked_here.push(d);
+            assigned[sym_idx] = false;
+            used[d as usize]  = false;
+        }
+        false
+    }
+
+    dfs_spine(0, n, &mut perm, &mut used, &mut assigned,
+              &var_order, &digit_order, groups, mode, base,
+              &mut spine_sols, &mut spine);
+
+    // Spine accumulates deepest-first during unwind; reverse to assignment order.
+    spine.reverse();
+
+    if spine_sols.is_empty() {
+        // No solution — return empty solutions and empty spine.
+        return (Vec::new(), spine);
+    }
+
+    // --- Step 2: collect up to max_solutions via the regular (fast) search ---
+    if max_solutions <= 1 {
+        return (spine_sols, spine);
+    }
+    let all_solutions = search(groups, n, mode, radix, digit_count, max_solutions, false, 0);
+    (all_solutions, spine)
+}
+
 // ════════════════════ Python binding ════════════════════
 
-/// arithmetic_search(n, alice, groups, radix=None, digit_count=None, mode=None, max_solutions=1)
+/// arithmetic_search(n, alice, groups, radix=None, digit_count=None, mode=None,
+///                   max_solutions=1, randomize=False, seed=0)
 ///   -> list of (perm, ops_valid)   (empty list when no solution)
 /// groups: list of (candidates, equations)
 ///   candidates: list of u8 op indices
 ///   equations: list of [l0, l1, r0, r1, res_len, r0, r1, ...]
 /// max_solutions: stop after collecting this many distinct digit assignments (default 1).
+/// randomize: when True, shuffle symbol-assignment order and digit-iteration order
+///            using a seeded xorshift64 PRNG instead of the weight-priority default.
+/// seed: seed for the PRNG (used only when randomize=True).
 #[pyfunction]
+#[pyo3(signature = (n, alice, groups, radix=None, digit_count=None, mode=None, max_solutions=None, randomize=None, seed=None))]
 fn arithmetic_search(
     n: usize,
     alice: bool,
@@ -558,6 +759,8 @@ fn arithmetic_search(
     digit_count: Option<usize>,
     mode: Option<u8>,
     max_solutions: Option<usize>,
+    randomize: Option<bool>,
+    seed: Option<u64>,
 ) -> PyResult<Vec<(Vec<u8>, Vec<Vec<u8>>)>> {
     let rust_groups: Vec<OpGroup> = groups
         .into_iter()
@@ -588,6 +791,8 @@ fn arithmetic_search(
         radix.unwrap_or(n),
         digit_count.unwrap_or(n),
         max_solutions.unwrap_or(1),
+        randomize.unwrap_or(false),
+        seed.unwrap_or(0),
     ))
 }
 
@@ -643,9 +848,64 @@ fn arithmetic_search_with_stats<'py>(
     Ok((result, dict))
 }
 
+/// arithmetic_search_traced(n, alice, groups, radix=None, digit_count=None, mode=None,
+///                          max_solutions=1)
+///   -> (solutions, spine)
+///   solutions: list of (perm, ops_valid)   — same format as arithmetic_search
+///   spine:     list of (sym_idx, accepted_digit, pruned, backtracked) — one entry per
+///              symbol in the accepted assignment chain (first solution only).
+///              pruned      = [(digit, group_idx), ...]  — forward-check rejections
+///              backtracked = [digit, ...]               — dead-end subtrees
+///              Empty when no solution is found.
+///
+/// Always uses canonical weight-priority variable ordering (randomize not supported).
+#[pyfunction]
+#[pyo3(signature = (n, alice, groups, radix=None, digit_count=None, mode=None, max_solutions=None))]
+fn arithmetic_search_traced(
+    n: usize,
+    alice: bool,
+    groups: Vec<(Vec<u8>, Vec<Vec<u8>>)>,
+    radix: Option<usize>,
+    digit_count: Option<usize>,
+    mode: Option<u8>,
+    max_solutions: Option<usize>,
+) -> PyResult<(Vec<(Vec<u8>, Vec<Vec<u8>>)>, Vec<(u8, u8, Vec<(u8, i32)>, Vec<u8>)>)> {
+    let rust_groups: Vec<OpGroup> = groups
+        .into_iter()
+        .map(|(cands, eqs)| {
+            let eqs = eqs
+                .into_iter()
+                .map(|e| EqData {
+                    l0: e[0],
+                    l1: e[1],
+                    r0: e[2],
+                    r1: e[3],
+                    res_len: e[4],
+                    has_sign: e[5] != 0,
+                    res_syms: e[6..].to_vec(),
+                })
+                .collect();
+            OpGroup {
+                candidates: cands,
+                eqs,
+            }
+        })
+        .collect();
+
+    Ok(search_traced(
+        &rust_groups,
+        n,
+        mode.unwrap_or(if alice { MODE_ALICE } else { MODE_STANDARD }),
+        radix.unwrap_or(n),
+        digit_count.unwrap_or(n),
+        max_solutions.unwrap_or(1),
+    ))
+}
+
 #[pymodule]
 fn alice_sovler_helper(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(arithmetic_search, m)?)?;
     m.add_function(wrap_pyfunction!(arithmetic_search_with_stats, m)?)?;
+    m.add_function(wrap_pyfunction!(arithmetic_search_traced, m)?)?;
     Ok(())
 }

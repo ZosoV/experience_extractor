@@ -71,7 +71,7 @@ def _get_query_lhs(row: pd.Series) -> dict | None:
 
 def _eval_row(row: pd.Series) -> dict:
     out: dict = {
-        "id": row.get("id"),
+        "problem_id": row.get("problem_id"),
         "gold": str(row["answer"]).strip(),
         "solver_answer": row.get("solver_answer"),
         "solver_correct": row.get("solver_correct"),
@@ -201,7 +201,7 @@ def main() -> None:
         partial = evaled[evaled["re_eval_correct"] & ~evaled["fully_validated"]]
         if len(partial):
             print(f"\n  ⚠  query-correct but not fully validated: {len(partial)}")
-            print(partial[["id", "gold", "re_eval_answer", "solver_strategy"]].to_string(index=False))
+            print(partial[["problem_id", "gold", "re_eval_answer", "solver_strategy"]].to_string(index=False))
 
     if evaluated:
         evaled = out[~out["skipped"]]
@@ -226,7 +226,7 @@ def main() -> None:
                 print(f"discrepancies (re_eval ≠ solver_correct): {len(disagree)}")
                 print(
                     disagree[
-                        ["id", "gold", "solver_answer", "re_eval_answer", "solver_strategy"]
+                        ["problem_id", "gold", "solver_answer", "re_eval_answer", "solver_strategy"]
                     ].to_string(index=False)
                 )
             else:
